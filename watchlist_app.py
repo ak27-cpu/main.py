@@ -19,6 +19,71 @@ def save_watchlist(tickers):
 # --- DATEN-LOGIK ---
 def get_analysis_data(symbol):
     try:
+        # Berechnung der Graham-Zahl (Wurzel aus 22,5 * EPS * Buchwert pro Aktie)
+# 22,5 ist der Graham-Standardfaktor (KGV 15 * KBV 1,5)
+def calculate_graham_number(eps, bvps):
+    if eps > 0 and bvps > 0:
+        return (22.5 * eps * bvps) ** 0.5
+    return None
+
+# Integration in die Daten-Abfrage
+info = stock.info
+eps = info.get('trailingEps', 0)
+bvps = info.get('bookValue', 0)
+hist_pe = info.get('trailingPE', 20) # Aktuelles KGV als Basis
+avg_pe_5y = 20 # Hier könnte man den 5-Jahres-Schnitt von yfinance laden
+
+# Fair Value Modellierung
+graham = calculate_graham_number(eps, bvps)
+pe_fair_value = eps * 18 # Beispiel: Fairer Wert bei KGV 18
+analyst_target = info.get('targetMeanPrice')
+
+# Durchschnitt bilden
+fair_values = [v for v in [graham, pe_fair_value, analyst_target] if v is not None]
+final_fair_value = sum(fair_values) / len(fair_values) if fair_values else current_price
+
+def get_analysis_data(symbol):
+    try:
+        stock = yf.Ticker(symbol)
+        info = stock.info
+        df = stock.history(period="1y")
+        
+        current_price = df['Close'].iloc[-1]
+        
+        # --- FUNDAMENTALER FAIR VALUE ---
+        eps = info.get('trailingEps', 0)
+        bvps = info.get('bookValue', 0)
+        
+        # 1. Graham Zahl (sehr konservativ)
+        graham = (22.5 * eps * bvps)**0.5 if eps > 0 and bvps > 0 else None
+        # 2. Analysten Target
+        target = info.get('targetMeanPrice')
+        # 3. KGV-Basis (Historisch faire Bewertung ca. 15-20x Gewinn)
+        pe_fair = eps * 18 
+        
+        # Kombinierter Fair Value (Gewichtet)
+        valid_values = [v for v in [graham, target, pe_fair] if v and v > 0]
+        fair_value = sum(valid_values) / len(valid_values) if valid_values else current_price
+        
+        # --- TECHNIK ---
+        df['RSI'] = ta.rsi(df['Close'], length=14)
+        rsi = df['RSI'].iloc[-1]
+        
+        # Abstände & Signale
+        discount = (current_price / fair_value - 1) * 100
+        
+        return {
+            "Ticker": symbol,
+            "Preis": round(current_price, 2),
+            "Fair Value (Ø)": round(fair_value, 2),
+            "Margin of Safety %": round(-discount, 2), # Wie viel Rabatt kriege ich?
+            "RSI (14)": round(rsi, 2),
+            "Status": "STARKER KAUF" if discount < -15 and rsi < 35 else "Beobachten"
+        }
+    except:
+        return None
+
+        
         # 1. Kursdaten via yfinance
         stock = yf.Ticker(symbol)
         df = stock.history(period="1y")
