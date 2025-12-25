@@ -5,7 +5,7 @@ import numpy as np
 from io import BytesIO
 
 # --- CONFIG & STYLE ---
-(page_title="Quick Checker", layout="wide")
+st.set_page_config(page_title="Quick Checker", layout="wide")
 
 st.markdown("""
     <style>
