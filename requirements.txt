@@ -6,4 +6,3 @@ finvizfinance
 xlsxwriter
 scikit-learn
 numpy
-json
