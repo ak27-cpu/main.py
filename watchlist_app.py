@@ -168,7 +168,7 @@ if data:
     st.dataframe(
         df_results.style.apply(style_table, axis=1)
         .format({"Margin %": "{:.1f}%", "Kurs": "{:.2f} €", "Fair Value": "{:.2f} €"}), 
-        width=1200
+        width=1300
     )
 
     # Backup-Download Funktion
