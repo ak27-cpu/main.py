@@ -5,3 +5,4 @@ pandas_ta
 finvizfinance
 xlsxwriter
 scikit-learn
+numpy
