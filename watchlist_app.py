@@ -10,43 +10,66 @@ WATCHLIST_FILE = "my_watchlist.csv"
 def load_watchlist():
     if os.path.exists(WATCHLIST_FILE):
         return pd.read_csv(WATCHLIST_FILE)['Ticker'].tolist()
-    return ["AAPL", "MSFT", "GOOGL", "TSLA"]
+    return ["AAPL", "MSFT", "GOOGL", "AMZN"]
 
 def save_watchlist(tickers):
     pd.DataFrame(tickers, columns=['Ticker']).to_csv(WATCHLIST_FILE, index=False)
 
-# --- AKTIENFINDER-LOGIK (FAIR VALUE BERECHNUNG) ---
-def calculate_advanced_fair_value(info):
-    """Berechnet den gemittelten fairen Wert aus EPS und Free Cashflow."""
+# --- DCF MODELL LOGIK ---
+def calculate_dcf(fcf, growth_rate, discount_rate=0.10, terminal_growth=0.02, years=10):
+    """Berechnet den Barwert der zukünftigen Cashflows (DCF)."""
+    try:
+        if not fcf or fcf <= 0: return None
+        
+        cashflows = []
+        # Projektionsphase (10 Jahre)
+        current_fcf = fcf
+        for year in range(1, years + 1):
+            current_fcf *= (1 + growth_rate)
+            # Diskontierung auf den heutigen Tag
+            pv = current_fcf / ((1 + discount_rate) ** year)
+            cashflows.append(pv)
+        
+        # Terminal Value (Wert nach 10 Jahren bis in die Ewigkeit)
+        last_fcf = cashflows[-1] * ((1 + discount_rate) ** years)
+        tv = (last_fcf * (1 + terminal_growth)) / (discount_rate - terminal_growth)
+        pv_tv = tv / ((1 + discount_rate) ** years)
+        
+        return sum(cashflows) + pv_tv
+    except:
+        return None
+
+# --- AKTIENFINDER PRO LOGIK ---
+def calculate_pro_fair_value(info):
     try:
         current_price = info.get('currentPrice')
         eps = info.get('trailingEps')
         fcf = info.get('freeCashflow')
         shares = info.get('sharesOutstanding')
-        growth_rate = info.get('earningsGrowth', 0.1) # Fallback 10% Wachstum
+        # Erwartetes Wachstum (Analystenschätzung oder Fallback 10%)
+        growth_estimate = info.get('earningsGrowth', 0.10)
+        if growth_estimate is None or growth_estimate < 0: growth_estimate = 0.08
         
-        if growth_rate is None: growth_rate = 0.1
-
-        # Dynamischer Multiplikator (Basis 15 + Wachstumskomponente)
-        # Eine Aktie mit 20% Wachstum bekommt ein höheres faires KGV als eine mit 5%.
-        fair_multiplier = 15 + (growth_rate * 50) 
-        fair_multiplier = max(12, min(fair_multiplier, 30)) # Begrenzung zwischen 12 und 30
-
-        # 1. Fair Value Gewinn (EPS)
-        fv_eps = eps * fair_multiplier if eps and eps > 0 else None
+        # 1. Fair Value Multiplikator-Modell (EPS & FCF)
+        fair_mult = 15 + (growth_estimate * 40)
+        fair_mult = max(12, min(fair_mult, 28))
         
-        # 2. Fair Value Free Cashflow (FCF)
+        fv_eps = eps * fair_mult if eps and eps > 0 else None
+        
         fcf_per_share = (fcf / shares) if fcf and shares else None
-        fv_fcf = fcf_per_share * fair_multiplier if fcf_per_share and fcf_per_share > 0 else None
+        fv_fcf = fcf_per_share * fair_mult if fcf_per_share and fcf_per_share > 0 else None
         
-        # 3. Mittelwert bilden (Vereinigter Fair Value)
-        valid_models = [v for v in [fv_eps, fv_fcf] if v is not None]
+        # 2. DCF Modell (Intrinsischer Wert)
+        total_dcf_value = calculate_dcf(fcf, growth_estimate)
+        fv_dcf = (total_dcf_value / shares) if total_dcf_value and shares else None
         
-        if not valid_models:
-            return current_price, 0 # Fallback
-            
-        final_fv = sum(valid_models) / len(valid_models)
-        return round(final_fv, 2), round(fair_multiplier, 1)
+        # 3. Vereinigter Fair Value (Mittelwert aus allen validen Modellen)
+        models = [v for v in [fv_eps, fv_fcf, fv_dcf] if v is not None and v > 0]
+        
+        if not models: return current_price, 15
+        
+        final_fv = sum(models) / len(models)
+        return round(final_fv, 2), round(fair_mult, 1)
     except:
         return info.get('currentPrice'), 15
 
@@ -60,56 +83,48 @@ def get_analysis_data(symbol):
         
         current_price = info.get('currentPrice', df['Close'].iloc[-1])
         
-        # Technik: RSI
+        # Technik: RSI & Korrektur
         df['RSI'] = ta.rsi(df['Close'], length=14)
         rsi = df['RSI'].iloc[-1]
         
-        # Technik: Korrektur-Statistik (Drawdown)
         high_52w = df['Close'].max()
         current_dd = ((current_price / high_52w) - 1) * 100
+        avg_correction = (df['Close'] / df['Close'].cummax() - 1)[lambda x: x < -0.05].mean() * 100
         
-        rolling_max = df['Close'].cummax()
-        drawdowns = (df['Close'] / rolling_max - 1)
-        avg_correction = drawdowns[drawdowns < -0.05].mean() * 100
+        # Fundamentaldaten
+        fair_value, mult = calculate_pro_fair_value(info)
+        margin = (1 - (current_price / fair_value)) * 100
         
-        # Fundamentaler Fair Value (Aktienfinder-Stil)
-        fair_value, used_mult = calculate_advanced_fair_value(info)
-        margin_of_safety = (1 - (current_price / fair_value)) * 100
-        
-        # Signal-Logik
-        is_cheap = current_price < (fair_value * 1.05) # 5% Puffer um den FV
-        is_oversold = rsi < 45
-        is_correction = current_dd <= (avg_correction * 0.8) # 80% der typischen Korrektur erreicht
-        
-        status = "Warten"
-        if margin_of_safety > 10 and is_oversold and is_correction:
-            status = "KAUFEN"
-        elif margin_of_safety > 0:
-            status = "Fair bewertet"
-        elif margin_of_safety < -15:
-            status = "Überhitzt"
+        # Status-Logik
+        status = "Halten"
+        if margin > 15 and rsi < 40 and current_dd <= avg_correction:
+            status = "STARKER KAUF"
+        elif margin > 5:
+            status = "Kaufenswert"
+        elif margin < -15:
+            status = "Überbewertet"
 
         return {
             "Ticker": symbol,
             "Kurs": round(current_price, 2),
-            "Fair Value (Aktienfinder)": fair_value,
-            "Margin %": round(margin_of_safety, 2),
+            "Fair Value (DCF+)": fair_value,
+            "Margin %": round(margin, 2),
             "RSI (14)": round(rsi, 2),
             "Korrektur %": round(current_dd, 2),
             "Ø Korr. %": round(avg_correction, 2),
-            "Mult.": used_mult,
             "Status": status
         }
-    except Exception:
+    except:
         return None
 
-# --- UI DESIGN (STREAMLIT) ---
-st.title("🚀 Aktienfinder Pro: Fair Value & Cashflow-Check")
+# --- UI (STREAMLIT) ---
+st.set_page_config(layout="wide") # Falls separat genutzt
+st.title("💎 Ultimative Aktien-Bewertung (DCF & Cashflow)")
 
 # Sidebar
-st.sidebar.header("Meine Watchlist")
+st.sidebar.header("Watchlist")
 current_tickers = load_watchlist()
-new_ticker = st.sidebar.text_input("Ticker Symbol (z.B. MSFT):").upper()
+new_ticker = st.sidebar.text_input("Ticker Symbol:").upper()
 
 if st.sidebar.button("Hinzufügen"):
     if new_ticker and new_ticker not in current_tickers:
@@ -117,46 +132,36 @@ if st.sidebar.button("Hinzufügen"):
         save_watchlist(current_tickers)
         st.rerun()
 
-remove_ticker = st.sidebar.selectbox("Ticker entfernen:", [""] + current_tickers)
-if st.sidebar.button("Entfernen"):
+remove_ticker = st.sidebar.selectbox("Entfernen:", [""] + current_tickers)
+if st.sidebar.button("Löschen"):
     if remove_ticker in current_tickers:
         current_tickers.remove(remove_ticker)
         save_watchlist(current_tickers)
         st.rerun()
 
-# Hauptanzeige
+# Tabelle anzeigen
 if current_tickers:
-    with st.spinner('Berechne fundamentale und technische Daten...'):
-        data_list = [get_analysis_data(s) for s in current_tickers]
-        results = [d for d in data_list if d is not None]
-        df_results = pd.DataFrame(results)
+    with st.spinner('Analysiere Fundamentaldaten und berechne DCF...'):
+        results = [d for d in [get_analysis_data(s) for s in current_tickers] if d]
+        df = pd.DataFrame(results)
 
-    # Farbliche Formatierung
     def style_status(row):
         color = ''
-        if row['Status'] == "KAUFEN":
-            color = 'background-color: #1e8449; color: white;' # Dunkelgrün
-        elif row['Status'] == "Fair bewertet":
-            color = 'background-color: #2e86c1; color: white;' # Blau
-        elif row['Status'] == "Überhitzt":
-            color = 'background-color: #b03a2e; color: white;' # Rot
+        if row['Status'] == "STARKER KAUF": color = 'background-color: #00ff00; color: black; font-weight: bold;'
+        elif row['Status'] == "Kaufenswert": color = 'background-color: #90ee90; color: black;'
+        elif row['Status'] == "Überbewertet": color = 'background-color: #ffcccb; color: black;'
         return [color] * len(row)
 
-    st.subheader("Watchlist Analyse")
-    st.dataframe(
-        df_results.style.apply(style_status, axis=1)
-        .format({"Margin %": "{:.1f}%", "Korrektur %": "{:.1f}%", "Ø Korr. %": "{:.1f}%"}),
-        use_container_width=True
-    )
+    st.dataframe(df.style.apply(style_status, axis=1).format({"Margin %": "{:.1f}%"}), use_container_width=True)
 
-    # Erklärungsbereich
-    with st.expander("ℹ️ Analyse-Methodik"):
+    with st.expander("🔬 Wie wir den fairen Wert berechnen"):
         st.markdown("""
-        - **Fair Value (Aktienfinder):** Gemittelter Wert aus dem fairen KGV (Gewinn) und dem fairen KCV (Free Cashflow).
-        - **Mult.:** Der angewendete Multiplikator. Er berechnet sich dynamisch aus dem Gewinnwachstum (höheres Wachstum = höherer Multiplikator).
-        - **Margin %:** Sicherheitsmarge. Positiv bedeutet, der Kurs liegt unter dem fairen Wert.
-        - **Kauf-Signal:** Erscheint, wenn die Aktie **unterbewertet** ist, der **RSI** niedrig steht und die **Korrektur** historisch groß genug ist.
-        """)
+        Wir nutzen eine **3-Säulen-Bewertung**:
+        1. **Gewinn-Modell (FV EPS):** Bewertet die Aktie nach ihrem bereinigten Gewinn und Wachstum.
+        2. **Cashflow-Modell (FV FCF):** Bewertet die Aktie nach dem tatsächlich generierten Bargeld.
+        3. **DCF-Modell:** Berechnet den Barwert aller Cashflows der nächsten 10 Jahre plus Terminal Value.
         
+        Die **Margin %** zeigt dir den Rabatt zum fairen Durchschnittswert. Ein 'STARKER KAUF' Signal erfordert Unterbewertung PLUS technische Überverkauftheit (RSI).
+        """)
 else:
-    st.info("Deine Watchlist ist leer. Nutze die Sidebar, um Aktien hinzuzufügen.")
+    st.info("Füge Ticker in der Sidebar hinzu.")
